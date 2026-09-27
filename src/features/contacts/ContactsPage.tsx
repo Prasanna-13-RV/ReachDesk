@@ -10,19 +10,35 @@ import { renderTemplate } from "@/lib/templates/renderTemplate";
 import { ContactFormModal } from "@/features/contacts/ContactFormModal";
 
 /**
- * FR-005 contact list: search + table with per-contact WhatsApp, status, and
- * edit actions, plus manual add (Phase 3/5).
- * TODO(Phase 3): sorting, city/category/campaign filters, row virtualization
- * for 10k+ rows (NFR-003).
+ * FR-005 contact list: search + filters (city/category/phone/status) + table
+ * with per-contact WhatsApp, status, and edit actions, plus manual add
+ * (Phase 3/5).
+ * TODO(Phase 3): sorting, campaign filter, row virtualization for 10k+ rows (NFR-003).
  */
 export function ContactsPage() {
   const { user } = useAuth();
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [search, setSearch] = useState("");
+  const [cityFilter, setCityFilter] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [phoneFilter, setPhoneFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<ContactStatus | "all">("all");
   const [isLoading, setIsLoading] = useState(true);
   const [templateContent, setTemplateContent] = useState<string | null>(null);
   const [editingContact, setEditingContact] = useState<Contact | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+
+  const hasActiveFilters = Boolean(
+    search || cityFilter || categoryFilter || phoneFilter || statusFilter !== "all",
+  );
+
+  function clearFilters() {
+    setSearch("");
+    setCityFilter("");
+    setCategoryFilter("");
+    setPhoneFilter("");
+    setStatusFilter("all");
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -38,19 +54,33 @@ export function ContactsPage() {
       if (search.trim()) {
         query = query.ilike("title", `%${search.trim()}%`);
       }
+      if (cityFilter.trim()) {
+        query = query.ilike("city", `%${cityFilter.trim()}%`);
+      }
+      if (categoryFilter.trim()) {
+        query = query.ilike("category_name", `%${categoryFilter.trim()}%`);
+      }
+      if (phoneFilter.trim()) {
+        query = query.or(
+          `phone_normalized.ilike.%${phoneFilter.trim()}%,phone_raw.ilike.%${phoneFilter.trim()}%`,
+        );
+      }
+      if (statusFilter !== "all") {
+        query = query.eq("status", statusFilter);
+      }
 
       const { data, error } = await query;
       if (!cancelled) {
         if (!error && data) setContacts(data as Contact[]);
         setIsLoading(false);
       }
-    }, 300); // debounce search input (Performance Strategy §21)
+    }, 300); // debounce search/filter input (Performance Strategy §21)
 
     return () => {
       cancelled = true;
       clearTimeout(handle);
     };
-  }, [search]);
+  }, [search, cityFilter, categoryFilter, phoneFilter, statusFilter]);
 
   useEffect(() => {
     // Most recently created active template is used to prefill WhatsApp messages.
@@ -65,12 +95,23 @@ export function ContactsPage() {
   }, []);
 
   async function reloadContacts() {
-    const { data, error } = await supabase
+    let query = supabase
       .from("contacts")
       .select("*")
       .eq("is_archived", false)
       .order("updated_at", { ascending: false })
       .limit(200);
+    if (search.trim()) query = query.ilike("title", `%${search.trim()}%`);
+    if (cityFilter.trim()) query = query.ilike("city", `%${cityFilter.trim()}%`);
+    if (categoryFilter.trim()) query = query.ilike("category_name", `%${categoryFilter.trim()}%`);
+    if (phoneFilter.trim()) {
+      query = query.or(
+        `phone_normalized.ilike.%${phoneFilter.trim()}%,phone_raw.ilike.%${phoneFilter.trim()}%`,
+      );
+    }
+    if (statusFilter !== "all") query = query.eq("status", statusFilter);
+
+    const { data, error } = await query;
     if (!error && data) setContacts(data as Contact[]);
   }
 
@@ -151,8 +192,53 @@ export function ContactsPage() {
         placeholder="Search by business title..."
         value={search}
         onChange={(e) => setSearch(e.target.value)}
-        className="mt-4 w-full max-w-sm rounded-md border border-border px-3 py-2 text-sm"
+        className="mt-4 w-full rounded-md border border-border px-3 py-2 text-sm sm:max-w-sm"
       />
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <input
+          type="text"
+          placeholder="Filter by city"
+          value={cityFilter}
+          onChange={(e) => setCityFilter(e.target.value)}
+          className="w-full rounded-md border border-border px-3 py-2 text-sm sm:w-auto sm:flex-1 sm:min-w-[10rem]"
+        />
+        <input
+          type="text"
+          placeholder="Filter by category"
+          value={categoryFilter}
+          onChange={(e) => setCategoryFilter(e.target.value)}
+          className="w-full rounded-md border border-border px-3 py-2 text-sm sm:w-auto sm:flex-1 sm:min-w-[10rem]"
+        />
+        <input
+          type="text"
+          placeholder="Filter by phone"
+          value={phoneFilter}
+          onChange={(e) => setPhoneFilter(e.target.value)}
+          className="w-full rounded-md border border-border px-3 py-2 text-sm sm:w-auto sm:flex-1 sm:min-w-[10rem]"
+        />
+        <select
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as ContactStatus | "all")}
+          className="w-full rounded-md border border-border px-3 py-2 text-sm sm:w-auto"
+        >
+          <option value="all">All statuses</option>
+          {CONTACT_STATUSES.map((status) => (
+            <option key={status} value={status}>
+              {CONTACT_STATUS_LABELS[status]}
+            </option>
+          ))}
+        </select>
+        {hasActiveFilters && (
+          <button
+            type="button"
+            onClick={clearFilters}
+            className="w-full rounded-md border border-border px-3 py-2 text-sm font-medium sm:w-auto"
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
 
       <div className="mt-4 overflow-x-auto rounded-lg border border-border">
         <table className="w-full text-left text-sm">
