@@ -7,7 +7,9 @@ import type { Contact } from "@/types/domain";
 import type { ContactStatus } from "@/types/database";
 import { normalizePhone, buildWhatsAppUrl } from "@/lib/phone/normalize";
 import { renderTemplate } from "@/lib/templates/renderTemplate";
+import { getWhatsAppTarget } from "@/lib/whatsapp/target";
 import { ContactFormModal } from "@/features/contacts/ContactFormModal";
+import { BulkSendModal } from "@/features/contacts/BulkSendModal";
 
 /**
  * FR-005 contact list: search + filters (city/category/phone/status) + table
@@ -23,13 +25,16 @@ export function ContactsPage() {
   const [categoryFilter, setCategoryFilter] = useState("");
   const [phoneFilter, setPhoneFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState<ContactStatus | "all">("all");
+  const [onlyValidPhone, setOnlyValidPhone] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [templateContent, setTemplateContent] = useState<string | null>(null);
   const [editingContact, setEditingContact] = useState<Contact | null>(null);
   const [isAdding, setIsAdding] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [isBulkSending, setIsBulkSending] = useState(false);
 
   const hasActiveFilters = Boolean(
-    search || cityFilter || categoryFilter || phoneFilter || statusFilter !== "all",
+    search || cityFilter || categoryFilter || phoneFilter || statusFilter !== "all" || onlyValidPhone,
   );
 
   function clearFilters() {
@@ -38,6 +43,7 @@ export function ContactsPage() {
     setCategoryFilter("");
     setPhoneFilter("");
     setStatusFilter("all");
+    setOnlyValidPhone(false);
   }
 
   useEffect(() => {
@@ -68,10 +74,14 @@ export function ContactsPage() {
       if (statusFilter !== "all") {
         query = query.eq("status", statusFilter);
       }
+      if (onlyValidPhone) {
+        query = query.eq("phone_valid", true);
+      }
 
       const { data, error } = await query;
       if (!cancelled) {
         if (!error && data) setContacts(data as Contact[]);
+        setSelectedIds(new Set());
         setIsLoading(false);
       }
     }, 300); // debounce search/filter input (Performance Strategy §21)
@@ -80,7 +90,7 @@ export function ContactsPage() {
       cancelled = true;
       clearTimeout(handle);
     };
-  }, [search, cityFilter, categoryFilter, phoneFilter, statusFilter]);
+  }, [search, cityFilter, categoryFilter, phoneFilter, statusFilter, onlyValidPhone]);
 
   useEffect(() => {
     // Most recently created active template is used to prefill WhatsApp messages.
@@ -110,20 +120,22 @@ export function ContactsPage() {
       );
     }
     if (statusFilter !== "all") query = query.eq("status", statusFilter);
+    if (onlyValidPhone) query = query.eq("phone_valid", true);
 
     const { data, error } = await query;
     if (!error && data) setContacts(data as Contact[]);
   }
 
-  function handleWhatsApp(contact: Contact) {
+  /** Opens WhatsApp for a contact and marks it sent; returns false if it couldn't be opened. */
+  function sendWhatsAppToContact(contact: Contact): boolean {
     if (contact.do_not_contact) {
       toast.error(`${contact.title} is marked "Do Not Contact".`);
-      return;
+      return false;
     }
     const normalized = normalizePhone(contact.phone_normalized ?? contact.phone_raw, contact.country_code);
     if (!normalized.isValid) {
       toast.error("This contact doesn't have a valid phone number.");
-      return;
+      return false;
     }
     const text = templateContent
       ? renderTemplate(templateContent, {
@@ -135,8 +147,8 @@ export function ContactsPage() {
           phone: normalized.e164 ?? undefined,
         }).text
       : undefined;
-    const url = buildWhatsAppUrl(normalized, text);
-    if (!url) return;
+    const url = buildWhatsAppUrl(normalized, text, getWhatsAppTarget());
+    if (!url) return false;
     window.open(url, "_blank", "noopener,noreferrer");
     void supabase.from("message_events").insert({
       user_id: contact.user_id,
@@ -147,7 +159,48 @@ export function ContactsPage() {
       message_snapshot: text ?? "",
       phone_used: normalized.e164 ?? "",
     });
+    void markContacted(contact);
+    return true;
   }
+
+  function handleWhatsApp(contact: Contact) {
+    sendWhatsAppToContact(contact);
+  }
+
+  // Clicking WhatsApp means the message was sent, but don't regress a contact
+  // that already replied/progressed further down the pipeline.
+  async function markContacted(contact: Contact) {
+    if (contact.status !== "pending" && contact.status !== "prepared") return;
+    setContacts((prev) =>
+      prev.map((c) => (c.id === contact.id ? { ...c, status: "contacted" } : c)),
+    );
+    const { error } = await supabase.from("contacts").update({ status: "contacted" }).eq("id", contact.id);
+    if (error) toast.error(error.message);
+  }
+
+  function toggleSelected(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  const sendableContacts = contacts.filter((c) => c.phone_valid && !c.do_not_contact);
+  const allSendableSelected =
+    sendableContacts.length > 0 && sendableContacts.every((c) => selectedIds.has(c.id));
+
+  function toggleSelectAll() {
+    setSelectedIds((prev) => {
+      if (allSendableSelected) return new Set();
+      return new Set([...prev, ...sendableContacts.map((c) => c.id)]);
+    });
+  }
+
+  const selectedContacts = contacts.filter(
+    (c) => selectedIds.has(c.id) && c.phone_valid && !c.do_not_contact,
+  );
 
   async function handleStatusChange(contact: Contact, status: ContactStatus) {
     setContacts((prev) => prev.map((c) => (c.id === contact.id ? { ...c, status } : c)));
@@ -178,13 +231,23 @@ export function ContactsPage() {
     <div>
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Contacts</h1>
-        <button
-          type="button"
-          onClick={() => setIsAdding(true)}
-          className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"
-        >
-          Add contact
-        </button>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setIsBulkSending(true)}
+            disabled={selectedContacts.length === 0}
+            className="rounded-md border border-border px-3 py-2 text-sm font-medium disabled:opacity-40"
+          >
+            Bulk send ({selectedContacts.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsAdding(true)}
+            className="rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground"
+          >
+            Add contact
+          </button>
+        </div>
       </div>
 
       <input
@@ -229,6 +292,14 @@ export function ContactsPage() {
             </option>
           ))}
         </select>
+        <label className="flex w-full items-center gap-2 rounded-md border border-border px-3 py-2 text-sm sm:w-auto">
+          <input
+            type="checkbox"
+            checked={onlyValidPhone}
+            onChange={(e) => setOnlyValidPhone(e.target.checked)}
+          />
+          <span>Has a valid phone number only</span>
+        </label>
         {hasActiveFilters && (
           <button
             type="button"
@@ -244,6 +315,14 @@ export function ContactsPage() {
         <table className="w-full text-left text-sm">
           <thead className="bg-muted/50 text-muted-foreground">
             <tr>
+              <th className="px-3 py-2">
+                <input
+                  type="checkbox"
+                  checked={allSendableSelected}
+                  onChange={toggleSelectAll}
+                  aria-label="Select all sendable contacts"
+                />
+              </th>
               <th className="px-3 py-2">Title</th>
               <th className="px-3 py-2">City</th>
               <th className="px-3 py-2">Phone</th>
@@ -258,20 +337,29 @@ export function ContactsPage() {
           <tbody>
             {isLoading && (
               <tr>
-                <td className="px-3 py-4 text-muted-foreground" colSpan={9}>
+                <td className="px-3 py-4 text-muted-foreground" colSpan={10}>
                   Loading…
                 </td>
               </tr>
             )}
             {!isLoading && contacts.length === 0 && (
               <tr>
-                <td className="px-3 py-4 text-muted-foreground" colSpan={9}>
+                <td className="px-3 py-4 text-muted-foreground" colSpan={10}>
                   No contacts yet. Import an Excel file or add one manually to get started.
                 </td>
               </tr>
             )}
             {contacts.map((contact) => (
               <tr key={contact.id} className="border-t border-border">
+                <td className="px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(contact.id)}
+                    onChange={() => toggleSelected(contact.id)}
+                    disabled={!contact.phone_valid || contact.do_not_contact}
+                    aria-label={`Select ${contact.title}`}
+                  />
+                </td>
                 <td className="px-3 py-2">{contact.title}</td>
                 <td className="px-3 py-2">{contact.city ?? "—"}</td>
                 <td className="px-3 py-2">
@@ -355,7 +443,19 @@ export function ContactsPage() {
           onSaved={reloadContacts}
         />
       )}
+
+      {isBulkSending && (
+        <BulkSendModal
+          contacts={selectedContacts}
+          onSend={sendWhatsAppToContact}
+          onClose={() => {
+            setIsBulkSending(false);
+            setSelectedIds(new Set());
+          }}
+        />
+      )}
     </div>
   );
 }
+
 

@@ -1,4 +1,5 @@
 import { parsePhoneNumberWithError, type CountryCode } from "libphonenumber-js";
+import { getAndroidPackage, isAndroid, type WhatsAppTarget } from "@/lib/whatsapp/target";
 
 export interface NormalizedPhone {
   /** E.164 formatted number, e.g. "+14155552671". Null when the number could not be validated. */
@@ -55,11 +56,27 @@ function normalizeCountryHint(countryCodeHint?: string | null): CountryCode | un
   return undefined;
 }
 
-/** Builds the wa.me URL for a validated, normalized phone number (FR-007, §18). */
-export function buildWhatsAppUrl(normalized: NormalizedPhone, prefilledText?: string): string | null {
+/**
+ * Builds the WhatsApp URL for a validated, normalized phone number (FR-007, §18).
+ * On Android, a non-default `target` deep-links straight into WhatsApp Business/Personal,
+ * skipping the "open with" chooser. Desktop/WhatsApp Web always falls back to wa.me, since
+ * there's no way to pick an account there — it uses whatever session is already logged in.
+ */
+export function buildWhatsAppUrl(
+  normalized: NormalizedPhone,
+  prefilledText?: string,
+  target: WhatsAppTarget = "default",
+): string | null {
   if (!normalized.isValid || !normalized.waNumber) {
     return null;
   }
+
+  const androidPackage = getAndroidPackage(target);
+  if (androidPackage && isAndroid()) {
+    const textParam = prefilledText ? `&text=${encodeURIComponent(prefilledText)}` : "";
+    return `intent://send?phone=${normalized.waNumber}${textParam}#Intent;scheme=whatsapp;package=${androidPackage};end`;
+  }
+
   const base = `https://wa.me/${normalized.waNumber}`;
   if (!prefilledText) {
     return base;
